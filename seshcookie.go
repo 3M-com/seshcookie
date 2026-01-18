@@ -128,6 +128,13 @@ type responseWriter[T proto.Message] struct {
 	wroteHeader int32
 }
 
+// Compile-time interface assertions
+var (
+	_ http.Hijacker = (*responseWriter[proto.Message])(nil)
+	_ http.Flusher  = (*responseWriter[proto.Message])(nil)
+	_ io.ReaderFrom = (*responseWriter[proto.Message])(nil)
+)
+
 // Config provides directives to a seshcookie instance on cookie
 // attributes, like if they are accessible from JavaScript and/or only
 // set on HTTPS connections.
@@ -437,14 +444,26 @@ func (s *responseWriter[T]) WriteHeader(code int) {
 }
 
 func (s *responseWriter[T]) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	// TODO: support hijacking with atomic flags
-	return nil, nil, fmt.Errorf("seshcookie doesn't support hijacking")
+	if hj, ok := s.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 }
 
 func (s *responseWriter[T]) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+func (s *responseWriter[T]) ReadFrom(r io.Reader) (int64, error) {
+	if atomic.LoadInt32(&s.wroteHeader) == 0 {
+		s.WriteHeader(http.StatusOK)
+	}
+	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(s.ResponseWriter, r)
 }
 
 func (h *Handler[T]) getCookieSession(req *http.Request) (T, []byte, *timestamppb.Timestamp) {

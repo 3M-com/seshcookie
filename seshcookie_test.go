@@ -5,11 +5,13 @@
 package seshcookie
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -421,6 +423,246 @@ func TestClearSessionError(t *testing.T) {
 	if err != ErrNoSession {
 		t.Errorf("expected ErrNoSession, got: %v", err)
 	}
+}
+
+// mockHijackableResponseWriter implements http.ResponseWriter and http.Hijacker
+type mockHijackableResponseWriter struct {
+	http.ResponseWriter
+	hijacked bool
+}
+
+func (m *mockHijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	m.hijacked = true
+	// Return a mock connection for testing
+	server, client := net.Pipe()
+	client.Close()
+	return server, bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server)), nil
+}
+
+// mockFlushableResponseWriter implements http.ResponseWriter and http.Flusher
+type mockFlushableResponseWriter struct {
+	http.ResponseWriter
+	flushed bool
+}
+
+func (m *mockFlushableResponseWriter) Flush() {
+	m.flushed = true
+}
+
+// mockReaderFromResponseWriter implements http.ResponseWriter and io.ReaderFrom
+type mockReaderFromResponseWriter struct {
+	http.ResponseWriter
+	readFromCalled bool
+	bytesRead      int64
+}
+
+func (m *mockReaderFromResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	m.readFromCalled = true
+	n, err := io.Copy(m.ResponseWriter, r)
+	m.bytesRead = n
+	return n, err
+}
+
+// TestHijackerProxying tests that Hijacker is properly proxied to underlying ResponseWriter
+func TestHijackerProxying(t *testing.T) {
+	key := createKeyString()
+	config := &Config{
+		CookieName: testCookieName,
+		HTTPOnly:   true,
+		Secure:     false,
+		MaxAge:     24 * time.Hour,
+	}
+
+	t.Run("proxies to hijackable underlying writer", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		mock := &mockHijackableResponseWriter{ResponseWriter: httptest.NewRecorder()}
+
+		hijackHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			hj, ok := rw.(http.Hijacker)
+			if !ok {
+				t.Fatal("expected responseWriter to implement http.Hijacker")
+			}
+
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack failed: %v", err)
+			}
+			if conn != nil {
+				conn.Close()
+			}
+		})
+
+		mw, err := NewMiddleware[*pb.TestSession](key, config)
+		if err != nil {
+			t.Fatalf("NewMiddleware: %s", err)
+		}
+
+		mw(hijackHandler).ServeHTTP(mock, req)
+
+		if !mock.hijacked {
+			t.Fatal("expected underlying ResponseWriter's Hijack to be called")
+		}
+	})
+
+	t.Run("returns error when underlying writer does not support hijacking", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		w := httptest.NewRecorder()
+
+		hijackHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			hj, ok := rw.(http.Hijacker)
+			if !ok {
+				t.Fatal("expected responseWriter to implement http.Hijacker")
+			}
+
+			_, _, err := hj.Hijack()
+			if err == nil {
+				t.Fatal("expected error when underlying writer doesn't support hijacking")
+			}
+		})
+
+		mw, err := NewMiddleware[*pb.TestSession](key, config)
+		if err != nil {
+			t.Fatalf("NewMiddleware: %s", err)
+		}
+
+		mw(hijackHandler).ServeHTTP(w, req)
+	})
+}
+
+// TestFlusherProxying tests that Flusher is properly proxied to underlying ResponseWriter
+func TestFlusherProxying(t *testing.T) {
+	key := createKeyString()
+	config := &Config{
+		CookieName: testCookieName,
+		HTTPOnly:   true,
+		Secure:     false,
+		MaxAge:     24 * time.Hour,
+	}
+
+	t.Run("proxies to flushable underlying writer", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		mock := &mockFlushableResponseWriter{ResponseWriter: httptest.NewRecorder()}
+
+		flushHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			f, ok := rw.(http.Flusher)
+			if !ok {
+				t.Fatal("expected responseWriter to implement http.Flusher")
+			}
+
+			f.Flush()
+		})
+
+		mw, err := NewMiddleware[*pb.TestSession](key, config)
+		if err != nil {
+			t.Fatalf("NewMiddleware: %s", err)
+		}
+
+		mw(flushHandler).ServeHTTP(mock, req)
+
+		if !mock.flushed {
+			t.Fatal("expected underlying ResponseWriter's Flush to be called")
+		}
+	})
+
+	t.Run("does not panic when underlying writer does not support flushing", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		w := httptest.NewRecorder()
+
+		flushHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			f, ok := rw.(http.Flusher)
+			if !ok {
+				t.Fatal("expected responseWriter to implement http.Flusher")
+			}
+
+			// Should not panic even if underlying writer doesn't support Flush
+			f.Flush()
+		})
+
+		mw, err := NewMiddleware[*pb.TestSession](key, config)
+		if err != nil {
+			t.Fatalf("NewMiddleware: %s", err)
+		}
+
+		mw(flushHandler).ServeHTTP(w, req)
+	})
+}
+
+// TestReaderFromProxying tests that io.ReaderFrom is properly proxied to underlying ResponseWriter
+func TestReaderFromProxying(t *testing.T) {
+	key := createKeyString()
+	config := &Config{
+		CookieName: testCookieName,
+		HTTPOnly:   true,
+		Secure:     false,
+		MaxAge:     24 * time.Hour,
+	}
+
+	t.Run("proxies to ReaderFrom-supporting underlying writer", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		mock := &mockReaderFromResponseWriter{ResponseWriter: httptest.NewRecorder()}
+
+		rfHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			rf, ok := rw.(io.ReaderFrom)
+			if !ok {
+				t.Fatal("expected responseWriter to implement io.ReaderFrom")
+			}
+
+			data := strings.NewReader("test data for ReadFrom")
+			n, err := rf.ReadFrom(data)
+			if err != nil {
+				t.Fatalf("ReadFrom failed: %v", err)
+			}
+			if n != 22 {
+				t.Fatalf("expected 22 bytes, got %d", n)
+			}
+		})
+
+		mw, err := NewMiddleware[*pb.TestSession](key, config)
+		if err != nil {
+			t.Fatalf("NewMiddleware: %s", err)
+		}
+
+		mw(rfHandler).ServeHTTP(mock, req)
+
+		if !mock.readFromCalled {
+			t.Fatal("expected underlying ResponseWriter's ReadFrom to be called")
+		}
+		if mock.bytesRead != 22 {
+			t.Fatalf("expected 22 bytes read, got %d", mock.bytesRead)
+		}
+	})
+
+	t.Run("falls back to io.Copy when underlying writer does not support ReaderFrom", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		w := httptest.NewRecorder()
+
+		rfHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			rf, ok := rw.(io.ReaderFrom)
+			if !ok {
+				t.Fatal("expected responseWriter to implement io.ReaderFrom")
+			}
+
+			data := strings.NewReader("test data")
+			n, err := rf.ReadFrom(data)
+			if err != nil {
+				t.Fatalf("ReadFrom failed: %v", err)
+			}
+			if n != 9 {
+				t.Fatalf("expected 9 bytes, got %d", n)
+			}
+		})
+
+		mw, err := NewMiddleware[*pb.TestSession](key, config)
+		if err != nil {
+			t.Fatalf("NewMiddleware: %s", err)
+		}
+
+		mw(rfHandler).ServeHTTP(w, req)
+
+		if w.Body.String() != "test data" {
+			t.Fatalf("expected 'test data', got %q", w.Body.String())
+		}
+	})
 }
 
 // TestSessionChangeDetection tests that unchanged sessions aren't re-written
