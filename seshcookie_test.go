@@ -665,6 +665,114 @@ func TestReaderFromProxying(t *testing.T) {
 	})
 }
 
+// TestVersionPrefix tests that encoded cookies have the sc1_ prefix and roundtrip correctly
+func TestVersionPrefix(t *testing.T) {
+	encKey := createKey()
+	maxAge := 24 * time.Hour
+
+	orig := &pb.TestSession{
+		Count: 7,
+		User:  "prefix-test",
+	}
+
+	encoded, _, err := encodeCookie(orig, encKey, maxAge, nil)
+	if err != nil {
+		t.Fatalf("encodeCookie: %v", err)
+	}
+
+	if !strings.HasPrefix(encoded, versionPrefix) {
+		t.Errorf("encoded cookie %q does not start with %q", encoded, versionPrefix)
+	}
+
+	decoded, _, _, err := decodeCookie[*pb.TestSession](encoded, encKey, maxAge)
+	if err != nil {
+		t.Fatalf("decodeCookie: %v", err)
+	}
+
+	if decoded.Count != orig.Count || decoded.User != orig.User {
+		t.Errorf("roundtrip mismatch: got {%d, %s}, want {%d, %s}",
+			decoded.Count, decoded.User, orig.Count, orig.User)
+	}
+}
+
+// TestLegacyGoCookieWithoutPrefix tests that cookies encoded by
+// pre-sc1_ versions of seshcookie are still readable after upgrade.
+func TestLegacyGoCookieWithoutPrefix(t *testing.T) {
+	key := createKeyString()
+	config := &Config{
+		CookieName: testCookieName,
+		HTTPOnly:   true,
+		Secure:     false,
+		MaxAge:     24 * time.Hour,
+	}
+
+	// Create a handler, set a session, capture the Go cookie
+	mw, err := NewMiddleware[*pb.TestSession](key, config)
+	if err != nil {
+		t.Fatalf("NewMiddleware: %v", err)
+	}
+
+	setHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		session, _ := GetSession[*pb.TestSession](req.Context())
+		session.Count = 99
+		session.User = "legacy"
+		SetSession(req.Context(), session)
+		rw.WriteHeader(200)
+	})
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	mw(setHandler).ServeHTTP(w, req)
+
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("expected 1 cookie, got %d", len(cookies))
+	}
+
+	goCookie := cookies[0]
+	if !strings.HasPrefix(goCookie.Value, versionPrefix) {
+		t.Fatalf("expected sc1_ prefix on cookie")
+	}
+
+	// Simulate a legacy cookie by stripping the sc1_ prefix
+	legacyCookie := &http.Cookie{
+		Name:  testCookieName,
+		Value: strings.TrimPrefix(goCookie.Value, versionPrefix),
+	}
+
+	// Send it to a fresh handler without migration - should still decode
+	readHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		session, err := GetSession[*pb.TestSession](req.Context())
+		if err != nil {
+			http.Error(rw, err.Error(), 500)
+			return
+		}
+		rw.WriteHeader(200)
+		fmt.Fprintf(rw, "count=%d user=%s", session.Count, session.User)
+	})
+
+	req = httptest.NewRequest("GET", "/", nil)
+	req.AddCookie(legacyCookie)
+	w = httptest.NewRecorder()
+
+	mw, err = NewMiddleware[*pb.TestSession](key, config)
+	if err != nil {
+		t.Fatalf("NewMiddleware: %v", err)
+	}
+	mw(readHandler).ServeHTTP(w, req)
+
+	resp := w.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	if string(body) != "count=99 user=legacy" {
+		t.Fatalf("body = %q, want %q", string(body), "count=99 user=legacy")
+	}
+}
+
 // TestSessionChangeDetection tests that unchanged sessions aren't re-written
 func TestSessionChangeDetection(t *testing.T) {
 	key := createKeyString()
